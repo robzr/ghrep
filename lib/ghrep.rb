@@ -22,12 +22,6 @@ module Ghrep
   require_relative 'ghrep/repo_spec.rb'
   require_relative 'ghrep/repos.rb'
 
-  DEFAULT = {
-    base_url: 'https://api.github.com/orgs/%s',
-    org:      '',
-    per_page: 100,
-  }
-
   # https://tools.ietf.org/html/rfc7231#section-6.1
   GITHUB_ERRORS = {
     401 => 'Unauthorized',

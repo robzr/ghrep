@@ -8,7 +8,7 @@ module Ghrep
 
     def parse(args)
       options = {
-        branch:          ENV['GIT_BRANCH'] || 'GHREP/search-and-replace',
+        branch:          ENV['GHREP_BRANCH'] || 'GHREP/search-and-replace',
         command:         :list,
         csv:             false,
         exclude:         %w(a gz icns ico jar png zip),
@@ -17,13 +17,13 @@ module Ghrep
         github_user:     ENV['GITHUB_USER'], 
         log_level:       NORMAL,
         message:         nil,
-        org:             DEFAULT[:org],
+        org:             ENV['GITHUB_ORG'],
         regex:           false,
-        repo_dir:        ENV['REPO_DIR'] || './github',
+        repo_dir:        ENV['GHREP_DIR'] || '~/github',
         search_boundary: '[^a-zA-Z0-9.-]',
         ssh_host:        ENV['GITHUB_HOST'],
         threads:         8,
-        title:           "[ghrep] #{ENV['GIT_BRANCH'] || 'GitHub Global Search & Replace'}",
+        title:           "[ghrep] #{ENV['GHREP_BRANCH'] || 'GitHub Global Search & Replace'}",
         output_width:    Ghrep::get_term_width,
       }
 
@@ -80,7 +80,7 @@ module Ghrep
         opts.separator ''
         opts.separator 'Options:'
         opts.on('-b', '--branch=BRANCH', 'Branch operated on (will be created for destructive actions)',
-                "(or use GIT_BRANCH env variable; current: #{options[:branch]})") do |arg|
+                "(or use GHREP_BRANCH env variable; current: #{options[:branch]})") do |arg|
           options[:branch] = arg
         end
         opts.on('--csv', "Use CSV output") do |arg|
@@ -89,7 +89,7 @@ module Ghrep
         opts.on('--debug', 'Debug log output') do
           options[:log_level] = DEBUG
         end
-        opts.on('-d', '--dir=DIR', "Target directory for repos (or use REPO_DIR env variable; current: #{options[:repo_dir]})") do |arg|
+        opts.on('-d', '--dir=DIR', "Target directory for repos (or use GHREP_DIR env variable; current: #{options[:repo_dir]})") do |arg|
           options[:repo_dir] = arg.sub(/\/*$/, '')
         end
         opts.on('--exclude=EXTENSIONS', "Exclude file extensions (default: #{options[:exclude].join(",")})") do |ext|
@@ -107,6 +107,9 @@ module Ghrep
         end
         opts.on('-m', '--message=MESSAGE', 'Commit message; use with --commit or --pull-request') do |mesg|
           options[:message] = mesg
+        end
+        opts.on('-o', '--github-org=ORG', 'GitHub org name (or use GITHUB_ORG env variable), defaults to user only') do |arg|
+          options[:github_org] = arg
         end
         opts.on('-q', '--quiet', 'Quiet log output') do
           options[:log_level] = QUIET
@@ -153,7 +156,7 @@ module Ghrep
 
       Ghrep::log :set_log_level, options[:log_level]
 
-      options[:base_url] = DEFAULT[:base_url] % options[:org]
+      options[:base_url] = 'https://api.github.com/%s' % (options[:github_org] ? "orgs/#{options[:github_org]}" : "users/#{options[:github_user]}")
 
       if options[:branch] == 'master' and !options[:force]
         Ghrep::log QUIET, "Error: operations not allowed on master branch.\n"

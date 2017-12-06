@@ -409,7 +409,7 @@ module Ghrep
     end
   
     def populate!
-      @github.get_all_pages("/repos?type=all&per_page=#{DEFAULT[:per_page]}")
+      @github.get_all_pages("/repos?type=all&per_page=100")
         .each do |repo_list|
           repo_list.content.each do |repo|
               repo_obj = Repo.new(github_object: repo,
@@ -432,7 +432,7 @@ module Ghrep
     end
   
     def get_remote_branches_of(repo)
-      pages = @github.get_all_pages(repo.branches_url.sub('{/branch}', "?per_page=#{DEFAULT[:per_page]}"))
+      pages = @github.get_all_pages(repo.branches_url.sub('{/branch}', "?per_page=100"))
       pages.reduce({}) do |a, e|
         new_hash = Hash[e.content.map { |b| [b['name'], b['commit']['sha']] }]
         a.merge new_hash

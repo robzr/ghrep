@@ -1,10 +1,8 @@
 #!/usr/bin/env ruby
 # -- @robzr
 
-#GHREP#
-require_relative 'lib/ghrep.rb'
-
 require 'pp'
+require_relative 'lib/ghrep.rb'
 
 begin
   options = Ghrep::ParseCommandLineArgs.instance().parse(ARGV)

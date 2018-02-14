@@ -12,11 +12,7 @@ begin
   eval "repos.#{options[:command].to_s}!"
 rescue Ghrep::GitHubError => error
   print "GitHubError Exception: #{error.message} "
-  if (options[:log_level] > 1)
-    puts error.backtrace.join("\n -> ")
-  else
-    puts error.backtrace[0..1].join("\n -> ")
-  end
+  puts error.backtrace.take(options[:log_level] < 2 ? 2 : 100).join("\n -> ")
   exit(-1)
 rescue Ghrep::ParseTermsError => error
   puts error.message

@@ -392,7 +392,7 @@ module Ghrep
         },
         state: {
           min: 10,
-          max: values.first.state_description_max_length,
+          max: values.first ? values.first.state_description_max_length : 10,
         },
         description: {
           min: 20,

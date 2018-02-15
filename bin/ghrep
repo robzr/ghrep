@@ -1,0 +1,1740 @@
+#!/usr/bin/env ruby
+# -- @robzr
+
+require 'pp'
+#require_relative 'lib/ghrep.rb'
+# TODO:
+# - Implement updated parser
+# - Implement /i search and /g replace modifiers
+# - Implement Topics add/subtract functionality
+# - Consider adding Slack notifications for pull request submission
+# - Consider adding pre-fetch/thread pool layer for blocking loops
+#
+require 'benchmark'
+require 'io/console'
+require 'pp'
+
+#require_relative 'ghrep/parse_command_line_args.rb'
+#
+module Ghrep
+  require 'singleton'
+  require 'optparse'
+
+  class ParseCommandLineArgs
+    include Singleton
+
+    def parse(args)
+      options = {
+        branch:          ENV['GHREP_BRANCH'] || 'GHREP/search-and-replace',
+        command:         :list,
+        csv:             false,
+        exclude:         %w(a gz icns ico jar png zip),
+        force:           false,
+        github_org:      ENV['GITHUB_ORG'],
+        github_token:    ENV['GITHUB_TOKEN'], 
+        github_user:     ENV['GITHUB_USER'], 
+        log_level:       NORMAL,
+        message:         nil,
+        regex:           false,
+        repo_dir:        ENV['GHREP_DIR'] || '~/github',
+        search_boundary: '[^a-zA-Z0-9.-]',
+        ssh_host:        ENV['GITHUB_HOST'],
+        threads:         8,
+        title:           "[ghrep] #{ENV['GHREP_BRANCH'] || 'GitHub Global Search & Replace'}",
+        output_width:    Ghrep::get_term_width,
+      }
+
+      op = OptionParser.new do |opts|
+        opts.banner = 'Usage: ghrep [options] (--<command> [repo_spec|sar_spec|search_spec ...])'
+        opts.separator "\nCommands available (default is --list):"
+        opts.on('-C', '--clone', 'Clone repos - skips existing local repos by default, overwrites with --force') do
+          options[:command] = :clone
+        end
+        opts.on('--commit', 'Commit staged changes (requires changes to be staged)') do
+          options[:command] = :commit
+        end
+        opts.on('-D', '--diff', 'Display a concise git diff') do
+          options[:command] = :diff
+        end
+        opts.on('-L', '--list', 'List local repos, status, branch and description') do
+          options[:command] = :list
+        end
+        opts.on('--pull-request', 'Submit pull request (requires branch to be pushed)') do
+          options[:command] = :pull_request
+        end
+        opts.on('--push', 'Push commits upstream (requires changes committed)') do
+          options[:command] = :push
+        end
+        opts.on('-R', '--reset', 'Reset repos to origin/master branch') do
+          options[:command] = :reset_to_master
+        end
+        opts.on('-S', '--search', 'Search - requires one or more search_spec - searches current branch') do
+          options[:command] = :search
+        end
+        opts.on('--sar', '--search-and-replace', 'Search and replace - requires one or more sar_spec') do
+          options[:command] = :search_and_replace
+        end
+        opts.on('--stage', 'Stage changes (will not stage in master)') do
+          options[:command] = :stage
+        end
+        opts.on('-T', '--topics', 'View or modify repo topics') do
+          options[:command] = :topics
+        end
+        opts.on('-U', '--update', 'Update repos (pull or fetch/rebase); checks out branch if exists') do
+          options[:command] = :update
+        end
+        opts.separator ''
+        opts.separator '    repo_spec is a comma-separated list of repo name and/or regexs used to match repo names.'
+        opts.separator '      ex: "legacy-prod,service-.*"'
+        opts.separator ''
+        opts.separator '    search_spec is [repo_spec,][s]/search[/,s/...] - search term(s) are static or a regex (with --regex)'
+        opts.separator '      ex: "s/hostname"'
+        opts.separator '      ex: "legacy.*,s/old_hostname,s/other_hostname/i"'
+        opts.separator ''
+        opts.separator '    sar_spec is [repo_spec,]s/search_string/replace_string/[modifier(s)] - Perl syntax named backrefs can be used.'
+        opts.separator '      ex: "service.*,s/old_hostname/new_hostname/gi"'
+        opts.separator '      ex: "legacy.*,service-.*,s/old(?<inc>\d\d).domain/new-$+{inc}.domain.name/gi"'
+        opts.separator ''
+        opts.separator 'Options:'
+        opts.on('-b', '--branch=BRANCH', 'Branch operated on (will be created for destructive actions)',
+                "(or use GHREP_BRANCH env variable; current: #{options[:branch]})") do |arg|
+          options[:branch] = arg
+        end
+        opts.on('--csv', "Use CSV output") do |arg|
+          options[:csv] = true
+        end
+        opts.on('--debug', 'Debug log output') do
+          options[:log_level] = DEBUG
+        end
+        opts.on('-d', '--dir=DIR', "Target directory for repos (or use GHREP_DIR env variable; current: #{options[:repo_dir]})") do |arg|
+          options[:repo_dir] = arg.sub(/\/*$/, '')
+        end
+        opts.on('--exclude=EXTENSIONS', "Exclude file extensions (default: #{options[:exclude].join(",")})") do |ext|
+          options[:exclude] = ext.split(',')
+        end
+        opts.on('-f', '--force', 'Action differs based on command') do
+          options[:force] = true
+        end
+        opts.on('--github-host=HOST', 'GitHub SSH Host string (or use GITHUB_HOST env variable) (current: git@github.com)') do |arg|
+          options[:ssh_host] = arg
+        end
+        opts.on('-h', '--help', 'Display this help') do
+          puts opts
+          exit 1
+        end
+        opts.on('-m', '--message=MESSAGE', 'Commit message; use with --commit or --pull-request') do |mesg|
+          options[:message] = mesg
+        end
+        opts.on('-o', '--github-org=ORG', 'GitHub org name (or use GITHUB_ORG env variable), defaults to user only') do |arg|
+          options[:github_org] = arg
+        end
+        opts.on('-q', '--quiet', 'Quiet log output') do
+          options[:log_level] = QUIET
+        end
+        opts.on('-r', '--regex', 'Use regex search strings') do
+          options[:regex] = true
+        end
+        opts.on('--search-boundary=BOUNDARY', "Search boundary (default: #{options[:search_boundary]})") do |arg|
+          options[:search_boundary] = arg
+        end
+        opts.on('-t', '--github-token=TOKEN', 'GitHub Personal Access Token (or use GITHUB_TOKEN env variable)',
+               'Obtain a Personal Access Token from GitHub -> Settings -> Developer Settings ') do |arg|
+          options[:github_token] = arg
+        end
+        opts.on('--threads=THREADS', "Max number of threads (default: #{options[:threads]})") do |arg|
+          options[:threads] = arg
+        end
+        opts.on('--title=TITLE', "Pull request title (default: \"#{options[:title]}\")") do |arg|
+          options[:title] = arg
+        end
+        opts.on('-u', '--github-user=USER', 'GitHub user name (or use GITHUB_USER env variable)') do |arg|
+          options[:github_user] = arg
+        end
+        opts.on('-v', '--verbose', 'Verbose log output') do
+          options[:log_level] = VERBOSE
+        end
+        opts.on('--width=COLUMNS', "Format output to this width (does not affect --csv, current: #{options[:output_width]})") do |arg|
+          options[:output_width] = arg
+        end
+        opts.separator ''
+        opts.separator '    This tool is designed around a particular git workflow. The set branch (see --branch) is used when available, and created'
+        opts.separator '    when destructive operations occur (ie: --search-and-replace), otherwise, master is used. Search (and replace) operations'
+        opts.separator '    are regex based, and are constructed with the supplied search (and replace) terms escaped (unless --regex is used), and'
+        opts.separator '    boundaried with all permutations of line start, line end and --boundary on both front and back.'
+        opts.separator ''
+        opts.separator '    Example usage:'
+        opts.separator '      ghrep --search --regex "AKIA.{16}" --csv      <- searches all repos AWS keys, output in CSV'
+        opts.separator '      ghrep --search --regex "aud.*,c,AKIA.{16}"    <- searches all repos starting with aud or c for AWS keys'
+        opts.separator '      ghrep --sar s/old_host/new_host/gi            <- searches and replace across all repos'
+        opts.separator '      ghrep --topics                                <- displays topics for all repos'
+      end
+      
+      op.parse!(args)
+
+      Ghrep::log :set_log_level, options[:log_level]
+
+      options[:base_url] = 'https://api.github.com/%s' % (options[:github_org] ? "orgs/#{options[:github_org]}" : "users/#{options[:github_user]}")
+
+      if options[:branch] == 'master' and !options[:force]
+        Ghrep::log QUIET, "Error: operations not allowed on master branch.\n"
+        exit(-1)
+      end
+
+      options.merge({ remaining_args: args })
+    end      
+  end      
+end
+#
+module Ghrep
+  require 'singleton'
+  require 'optparse'
+
+  class ParseCommandLineArgs
+    include Singleton
+
+    def parse(args)
+      options = {
+        branch:          ENV['GHREP_BRANCH'] || 'GHREP/search-and-replace',
+        command:         :list,
+        csv:             false,
+        exclude:         %w(a gz icns ico jar png zip),
+        force:           false,
+        github_org:      ENV['GITHUB_ORG'],
+        github_token:    ENV['GITHUB_TOKEN'], 
+        github_user:     ENV['GITHUB_USER'], 
+        log_level:       NORMAL,
+        message:         nil,
+        regex:           false,
+        repo_dir:        ENV['GHREP_DIR'] || '~/github',
+        search_boundary: '[^a-zA-Z0-9.-]',
+        ssh_host:        ENV['GITHUB_HOST'],
+        threads:         8,
+        title:           "[ghrep] #{ENV['GHREP_BRANCH'] || 'GitHub Global Search & Replace'}",
+        output_width:    Ghrep::get_term_width,
+      }
+
+      op = OptionParser.new do |opts|
+        opts.banner = 'Usage: ghrep [options] (--<command> [repo_spec|sar_spec|search_spec ...])'
+        opts.separator "\nCommands available (default is --list):"
+        opts.on('-C', '--clone', 'Clone repos - skips existing local repos by default, overwrites with --force') do
+          options[:command] = :clone
+        end
+        opts.on('--commit', 'Commit staged changes (requires changes to be staged)') do
+          options[:command] = :commit
+        end
+        opts.on('-D', '--diff', 'Display a concise git diff') do
+          options[:command] = :diff
+        end
+        opts.on('-L', '--list', 'List local repos, status, branch and description') do
+          options[:command] = :list
+        end
+        opts.on('--pull-request', 'Submit pull request (requires branch to be pushed)') do
+          options[:command] = :pull_request
+        end
+        opts.on('--push', 'Push commits upstream (requires changes committed)') do
+          options[:command] = :push
+        end
+        opts.on('-R', '--reset', 'Reset repos to origin/master branch') do
+          options[:command] = :reset_to_master
+        end
+        opts.on('-S', '--search', 'Search - requires one or more search_spec - searches current branch') do
+          options[:command] = :search
+        end
+        opts.on('--sar', '--search-and-replace', 'Search and replace - requires one or more sar_spec') do
+          options[:command] = :search_and_replace
+        end
+        opts.on('--stage', 'Stage changes (will not stage in master)') do
+          options[:command] = :stage
+        end
+        opts.on('-T', '--topics', 'View or modify repo topics') do
+          options[:command] = :topics
+        end
+        opts.on('-U', '--update', 'Update repos (pull or fetch/rebase); checks out branch if exists') do
+          options[:command] = :update
+        end
+        opts.separator ''
+        opts.separator '    repo_spec is a comma-separated list of repo name and/or regexs used to match repo names.'
+        opts.separator '      ex: "legacy-prod,service-.*"'
+        opts.separator ''
+        opts.separator '    search_spec is [repo_spec,][s]/search[/,s/...] - search term(s) are static or a regex (with --regex)'
+        opts.separator '      ex: "s/hostname"'
+        opts.separator '      ex: "legacy.*,s/old_hostname,s/other_hostname/i"'
+        opts.separator ''
+        opts.separator '    sar_spec is [repo_spec,]s/search_string/replace_string/[modifier(s)] - Perl syntax named backrefs can be used.'
+        opts.separator '      ex: "service.*,s/old_hostname/new_hostname/gi"'
+        opts.separator '      ex: "legacy.*,service-.*,s/old(?<inc>\d\d).domain/new-$+{inc}.domain.name/gi"'
+        opts.separator ''
+        opts.separator 'Options:'
+        opts.on('-b', '--branch=BRANCH', 'Branch operated on (will be created for destructive actions)',
+                "(or use GHREP_BRANCH env variable; current: #{options[:branch]})") do |arg|
+          options[:branch] = arg
+        end
+        opts.on('--csv', "Use CSV output") do |arg|
+          options[:csv] = true
+        end
+        opts.on('--debug', 'Debug log output') do
+          options[:log_level] = DEBUG
+        end
+        opts.on('-d', '--dir=DIR', "Target directory for repos (or use GHREP_DIR env variable; current: #{options[:repo_dir]})") do |arg|
+          options[:repo_dir] = arg.sub(/\/*$/, '')
+        end
+        opts.on('--exclude=EXTENSIONS', "Exclude file extensions (default: #{options[:exclude].join(",")})") do |ext|
+          options[:exclude] = ext.split(',')
+        end
+        opts.on('-f', '--force', 'Action differs based on command') do
+          options[:force] = true
+        end
+        opts.on('--github-host=HOST', 'GitHub SSH Host string (or use GITHUB_HOST env variable) (current: git@github.com)') do |arg|
+          options[:ssh_host] = arg
+        end
+        opts.on('-h', '--help', 'Display this help') do
+          puts opts
+          exit 1
+        end
+        opts.on('-m', '--message=MESSAGE', 'Commit message; use with --commit or --pull-request') do |mesg|
+          options[:message] = mesg
+        end
+        opts.on('-o', '--github-org=ORG', 'GitHub org name (or use GITHUB_ORG env variable), defaults to user only') do |arg|
+          options[:github_org] = arg
+        end
+        opts.on('-q', '--quiet', 'Quiet log output') do
+          options[:log_level] = QUIET
+        end
+        opts.on('-r', '--regex', 'Use regex search strings') do
+          options[:regex] = true
+        end
+        opts.on('--search-boundary=BOUNDARY', "Search boundary (default: #{options[:search_boundary]})") do |arg|
+          options[:search_boundary] = arg
+        end
+        opts.on('-t', '--github-token=TOKEN', 'GitHub Personal Access Token (or use GITHUB_TOKEN env variable)',
+               'Obtain a Personal Access Token from GitHub -> Settings -> Developer Settings ') do |arg|
+          options[:github_token] = arg
+        end
+        opts.on('--threads=THREADS', "Max number of threads (default: #{options[:threads]})") do |arg|
+          options[:threads] = arg
+        end
+        opts.on('--title=TITLE', "Pull request title (default: \"#{options[:title]}\")") do |arg|
+          options[:title] = arg
+        end
+        opts.on('-u', '--github-user=USER', 'GitHub user name (or use GITHUB_USER env variable)') do |arg|
+          options[:github_user] = arg
+        end
+        opts.on('-v', '--verbose', 'Verbose log output') do
+          options[:log_level] = VERBOSE
+        end
+        opts.on('--width=COLUMNS', "Format output to this width (does not affect --csv, current: #{options[:output_width]})") do |arg|
+          options[:output_width] = arg
+        end
+        opts.separator ''
+        opts.separator '    This tool is designed around a particular git workflow. The set branch (see --branch) is used when available, and created'
+        opts.separator '    when destructive operations occur (ie: --search-and-replace), otherwise, master is used. Search (and replace) operations'
+        opts.separator '    are regex based, and are constructed with the supplied search (and replace) terms escaped (unless --regex is used), and'
+        opts.separator '    boundaried with all permutations of line start, line end and --boundary on both front and back.'
+        opts.separator ''
+        opts.separator '    Example usage:'
+        opts.separator '      ghrep --search --regex "AKIA.{16}" --csv      <- searches all repos AWS keys, output in CSV'
+        opts.separator '      ghrep --search --regex "aud.*,c,AKIA.{16}"    <- searches all repos starting with aud or c for AWS keys'
+        opts.separator '      ghrep --sar s/old_host/new_host/gi            <- searches and replace across all repos'
+        opts.separator '      ghrep --topics                                <- displays topics for all repos'
+      end
+      
+      op.parse!(args)
+
+      Ghrep::log :set_log_level, options[:log_level]
+
+      options[:base_url] = 'https://api.github.com/%s' % (options[:github_org] ? "orgs/#{options[:github_org]}" : "users/#{options[:github_user]}")
+
+      if options[:branch] == 'master' and !options[:force]
+        Ghrep::log QUIET, "Error: operations not allowed on master branch.\n"
+        exit(-1)
+      end
+
+      options.merge({ remaining_args: args })
+    end      
+  end      
+end
+#require_relative 'ghrep/git_command.rb'
+module Ghrep
+  class GitCommand
+    attr_reader :output, :exitstatus
+
+    def initialize(args:, path: false, stdout: false)
+      @args, @path = args, path
+      stdout ? run_via_system : run_via_popen
+    end
+
+    private
+
+    def command_line
+      if @args.is_a?(Array)
+        [GIT_COMMAND, *@args]
+      else
+        "#{GIT_COMMAND} #{@args}"
+      end
+    end
+
+    def environment
+     {
+       'GIT_DIR'       => @path ? "#{@path}/.git" : nil,
+       'GIT_WORK_TREE' => @path,
+       'LC_ALL'        => 'C',
+     }
+    end
+
+    def run_via_popen
+      IO.popen(environment, command_line) do |io|
+        @output = io.readlines
+        io.close
+        @exitstatus = $?.exitstatus
+      end
+    end
+
+    def run_via_system
+      system(environment, [*command_line].join(' '))
+      @exitstatus = $?.exitstatus
+    end
+  end
+end
+#require_relative 'ghrep/github.rb'
+module Ghrep
+  require 'json'
+  require 'net/http'
+
+  class GitHub
+    def initialize(base_url:, user:, token:)
+      @user, @token = user, token
+      @base_url = base_url
+      create_struct_githubresponse
+    end
+
+    def get(url)
+      uri = URI.parse(fluff_url url)
+      request = Net::HTTP::Get.new(uri.request_uri, default_headers)
+      request.basic_auth(@user, @token)
+      Struct::GitHubResponse.new(http(uri).request request)
+    end
+
+    def get_all_pages(url)
+      return [] unless url
+      response = get url
+      [response] + get_all_pages(response.next_link)
+    end
+
+    def post(url: nil, body: nil, form: nil)
+      uri = URI.parse(fluff_url url)
+      request = Net::HTTP::Post.new(uri.request_uri, default_headers)
+      request.basic_auth(@user, @token)
+      if body
+        request.body = body 
+      elsif form
+        request.set_form_data form
+      end
+      Struct::GitHubResponse.new(http(uri).request request)
+    end
+
+    def put(url: nil, body: nil, form: nil)
+      uri = URI.parse(fluff_url url)
+      request = Net::HTTP::Put.new(uri.request_uri, default_headers)
+      request.basic_auth(@user, @token)
+      if body
+        request.body = body 
+      elsif form
+        request.set_form_data form
+      end
+      Struct::GitHubResponse.new(http(uri).request request)
+    end
+
+    private
+
+    def create_struct_githubresponse
+      Struct.new('GitHubResponse', :response) do
+        def initialize(*args)
+          super
+          unless [200, 201].include? code
+            raise GitHubError, code, prepend_details_to_backtrace
+          end
+        end
+
+        def code
+          response.code.to_i
+        end
+
+        def content
+          JSON.parse(response.body)
+        rescue JSON::ParserError
+          response.body
+        end
+
+        def links
+          response['link'].to_s.split(/,\s*/).map do |link|
+            url, rel = /<([^>]*)>;\s*rel="(.*)"/.match(link)[1, 2]
+            [rel.to_sym, url]
+          end.flatten
+        end
+
+        def next_link
+          Hash[*links][:next]
+        end
+
+        private
+
+        def prepend_details_to_backtrace
+          bt = []
+          if content.is_a?(Hash)
+            bt << "Message: #{content['message']}" if content.key?('message')
+            bt += content['errors'].to_a.map do |error|
+                    if error['code'] == 'custom'            
+                      "Resource => #{error['resource']} Message => #{error['message']}"
+                    elsif error['code'] == 'invalid' and error['field'] == 'head'
+                      'Branch not pushed, or was already deleted.'
+                    else
+                      "Unknown: #{error.inspect}"
+                    end
+                  end
+          end
+          bt + Kernel.caller
+        end
+      end
+    end
+
+    def default_headers
+      { 
+        'Accept': 'application/vnd.github.mercy-preview+json',
+        'Content-Type': 'text/json'
+      }
+    end
+
+    # manages a (probably unnecessary) hash of persistent connections
+    def http(uri)
+      stream = [uri.host, uri.port]
+      @http ||= {}
+      unless @http.key?(stream) && @http[stream].active?
+        @http[stream] = Net::HTTPSession.new(uri.host, uri.port)
+        @http[stream].use_ssl = true
+        @http[stream].start
+      end
+      @http[stream]
+    end
+
+    def fluff_url(url)
+      %r{^/}.match(url) ? "#{@base_url}#{url}" : url
+    end
+  end
+
+  class GitHubError < StandardError ; end
+end
+#require_relative 'ghrep/github_error_message.rb'
+module Ghrep
+  class GitHubErrorMessage
+    attr_reader :code, :message
+
+    def initialize(code: nil, message: nil)
+      @code, @message = code, message
+    end
+
+    def to_s
+      @message
+    end
+  end
+end
+#require_relative 'ghrep/log.rb'
+module Ghrep
+  require 'singleton'
+
+  class Log
+    include Singleton
+
+    def log(log_level=NORMAL, message)
+      if log_level == :set_log_level
+        @set_log_level = message
+      else
+        print message if log_level <= (@set_log_level || NORMAL)
+      end
+    end
+  end
+end
+#require_relative 'ghrep/parse_command_line_args.rb'
+#
+module Ghrep
+  require 'singleton'
+  require 'optparse'
+
+  class ParseCommandLineArgs
+    include Singleton
+
+    def parse(args)
+      options = {
+        branch:          ENV['GHREP_BRANCH'] || 'GHREP/search-and-replace',
+        command:         :list,
+        csv:             false,
+        exclude:         %w(a gz icns ico jar png zip),
+        force:           false,
+        github_org:      ENV['GITHUB_ORG'],
+        github_token:    ENV['GITHUB_TOKEN'], 
+        github_user:     ENV['GITHUB_USER'], 
+        log_level:       NORMAL,
+        message:         nil,
+        regex:           false,
+        repo_dir:        ENV['GHREP_DIR'] || '~/github',
+        search_boundary: '[^a-zA-Z0-9.-]',
+        ssh_host:        ENV['GITHUB_HOST'],
+        threads:         8,
+        title:           "[ghrep] #{ENV['GHREP_BRANCH'] || 'GitHub Global Search & Replace'}",
+        output_width:    Ghrep::get_term_width,
+      }
+
+      op = OptionParser.new do |opts|
+        opts.banner = 'Usage: ghrep [options] (--<command> [repo_spec|sar_spec|search_spec ...])'
+        opts.separator "\nCommands available (default is --list):"
+        opts.on('-C', '--clone', 'Clone repos - skips existing local repos by default, overwrites with --force') do
+          options[:command] = :clone
+        end
+        opts.on('--commit', 'Commit staged changes (requires changes to be staged)') do
+          options[:command] = :commit
+        end
+        opts.on('-D', '--diff', 'Display a concise git diff') do
+          options[:command] = :diff
+        end
+        opts.on('-L', '--list', 'List local repos, status, branch and description') do
+          options[:command] = :list
+        end
+        opts.on('--pull-request', 'Submit pull request (requires branch to be pushed)') do
+          options[:command] = :pull_request
+        end
+        opts.on('--push', 'Push commits upstream (requires changes committed)') do
+          options[:command] = :push
+        end
+        opts.on('-R', '--reset', 'Reset repos to origin/master branch') do
+          options[:command] = :reset_to_master
+        end
+        opts.on('-S', '--search', 'Search - requires one or more search_spec - searches current branch') do
+          options[:command] = :search
+        end
+        opts.on('--sar', '--search-and-replace', 'Search and replace - requires one or more sar_spec') do
+          options[:command] = :search_and_replace
+        end
+        opts.on('--stage', 'Stage changes (will not stage in master)') do
+          options[:command] = :stage
+        end
+        opts.on('-T', '--topics', 'View or modify repo topics') do
+          options[:command] = :topics
+        end
+        opts.on('-U', '--update', 'Update repos (pull or fetch/rebase); checks out branch if exists') do
+          options[:command] = :update
+        end
+        opts.separator ''
+        opts.separator '    repo_spec is a comma-separated list of repo name and/or regexs used to match repo names.'
+        opts.separator '      ex: "legacy-prod,service-.*"'
+        opts.separator ''
+        opts.separator '    search_spec is [repo_spec,][s]/search[/,s/...] - search term(s) are static or a regex (with --regex)'
+        opts.separator '      ex: "s/hostname"'
+        opts.separator '      ex: "legacy.*,s/old_hostname,s/other_hostname/i"'
+        opts.separator ''
+        opts.separator '    sar_spec is [repo_spec,]s/search_string/replace_string/[modifier(s)] - Perl syntax named backrefs can be used.'
+        opts.separator '      ex: "service.*,s/old_hostname/new_hostname/gi"'
+        opts.separator '      ex: "legacy.*,service-.*,s/old(?<inc>\d\d).domain/new-$+{inc}.domain.name/gi"'
+        opts.separator ''
+        opts.separator 'Options:'
+        opts.on('-b', '--branch=BRANCH', 'Branch operated on (will be created for destructive actions)',
+                "(or use GHREP_BRANCH env variable; current: #{options[:branch]})") do |arg|
+          options[:branch] = arg
+        end
+        opts.on('--csv', "Use CSV output") do |arg|
+          options[:csv] = true
+        end
+        opts.on('--debug', 'Debug log output') do
+          options[:log_level] = DEBUG
+        end
+        opts.on('-d', '--dir=DIR', "Target directory for repos (or use GHREP_DIR env variable; current: #{options[:repo_dir]})") do |arg|
+          options[:repo_dir] = arg.sub(/\/*$/, '')
+        end
+        opts.on('--exclude=EXTENSIONS', "Exclude file extensions (default: #{options[:exclude].join(",")})") do |ext|
+          options[:exclude] = ext.split(',')
+        end
+        opts.on('-f', '--force', 'Action differs based on command') do
+          options[:force] = true
+        end
+        opts.on('--github-host=HOST', 'GitHub SSH Host string (or use GITHUB_HOST env variable) (current: git@github.com)') do |arg|
+          options[:ssh_host] = arg
+        end
+        opts.on('-h', '--help', 'Display this help') do
+          puts opts
+          exit 1
+        end
+        opts.on('-m', '--message=MESSAGE', 'Commit message; use with --commit or --pull-request') do |mesg|
+          options[:message] = mesg
+        end
+        opts.on('-o', '--github-org=ORG', 'GitHub org name (or use GITHUB_ORG env variable), defaults to user only') do |arg|
+          options[:github_org] = arg
+        end
+        opts.on('-q', '--quiet', 'Quiet log output') do
+          options[:log_level] = QUIET
+        end
+        opts.on('-r', '--regex', 'Use regex search strings') do
+          options[:regex] = true
+        end
+        opts.on('--search-boundary=BOUNDARY', "Search boundary (default: #{options[:search_boundary]})") do |arg|
+          options[:search_boundary] = arg
+        end
+        opts.on('-t', '--github-token=TOKEN', 'GitHub Personal Access Token (or use GITHUB_TOKEN env variable)',
+               'Obtain a Personal Access Token from GitHub -> Settings -> Developer Settings ') do |arg|
+          options[:github_token] = arg
+        end
+        opts.on('--threads=THREADS', "Max number of threads (default: #{options[:threads]})") do |arg|
+          options[:threads] = arg
+        end
+        opts.on('--title=TITLE', "Pull request title (default: \"#{options[:title]}\")") do |arg|
+          options[:title] = arg
+        end
+        opts.on('-u', '--github-user=USER', 'GitHub user name (or use GITHUB_USER env variable)') do |arg|
+          options[:github_user] = arg
+        end
+        opts.on('-v', '--verbose', 'Verbose log output') do
+          options[:log_level] = VERBOSE
+        end
+        opts.on('--width=COLUMNS', "Format output to this width (does not affect --csv, current: #{options[:output_width]})") do |arg|
+          options[:output_width] = arg
+        end
+        opts.separator ''
+        opts.separator '    This tool is designed around a particular git workflow. The set branch (see --branch) is used when available, and created'
+        opts.separator '    when destructive operations occur (ie: --search-and-replace), otherwise, master is used. Search (and replace) operations'
+        opts.separator '    are regex based, and are constructed with the supplied search (and replace) terms escaped (unless --regex is used), and'
+        opts.separator '    boundaried with all permutations of line start, line end and --boundary on both front and back.'
+        opts.separator ''
+        opts.separator '    Example usage:'
+        opts.separator '      ghrep --search --regex "AKIA.{16}" --csv      <- searches all repos AWS keys, output in CSV'
+        opts.separator '      ghrep --search --regex "aud.*,c,AKIA.{16}"    <- searches all repos starting with aud or c for AWS keys'
+        opts.separator '      ghrep --sar s/old_host/new_host/gi            <- searches and replace across all repos'
+        opts.separator '      ghrep --topics                                <- displays topics for all repos'
+      end
+      
+      op.parse!(args)
+
+      Ghrep::log :set_log_level, options[:log_level]
+
+      options[:base_url] = 'https://api.github.com/%s' % (options[:github_org] ? "orgs/#{options[:github_org]}" : "users/#{options[:github_user]}")
+
+      if options[:branch] == 'master' and !options[:force]
+        Ghrep::log QUIET, "Error: operations not allowed on master branch.\n"
+        exit(-1)
+      end
+
+      options.merge({ remaining_args: args })
+    end      
+  end      
+end
+#
+module Ghrep
+  require 'singleton'
+  require 'optparse'
+
+  class ParseCommandLineArgs
+    include Singleton
+
+    def parse(args)
+      options = {
+        branch:          ENV['GHREP_BRANCH'] || 'GHREP/search-and-replace',
+        command:         :list,
+        csv:             false,
+        exclude:         %w(a gz icns ico jar png zip),
+        force:           false,
+        github_org:      ENV['GITHUB_ORG'],
+        github_token:    ENV['GITHUB_TOKEN'], 
+        github_user:     ENV['GITHUB_USER'], 
+        log_level:       NORMAL,
+        message:         nil,
+        regex:           false,
+        repo_dir:        ENV['GHREP_DIR'] || '~/github',
+        search_boundary: '[^a-zA-Z0-9.-]',
+        ssh_host:        ENV['GITHUB_HOST'],
+        threads:         8,
+        title:           "[ghrep] #{ENV['GHREP_BRANCH'] || 'GitHub Global Search & Replace'}",
+        output_width:    Ghrep::get_term_width,
+      }
+
+      op = OptionParser.new do |opts|
+        opts.banner = 'Usage: ghrep [options] (--<command> [repo_spec|sar_spec|search_spec ...])'
+        opts.separator "\nCommands available (default is --list):"
+        opts.on('-C', '--clone', 'Clone repos - skips existing local repos by default, overwrites with --force') do
+          options[:command] = :clone
+        end
+        opts.on('--commit', 'Commit staged changes (requires changes to be staged)') do
+          options[:command] = :commit
+        end
+        opts.on('-D', '--diff', 'Display a concise git diff') do
+          options[:command] = :diff
+        end
+        opts.on('-L', '--list', 'List local repos, status, branch and description') do
+          options[:command] = :list
+        end
+        opts.on('--pull-request', 'Submit pull request (requires branch to be pushed)') do
+          options[:command] = :pull_request
+        end
+        opts.on('--push', 'Push commits upstream (requires changes committed)') do
+          options[:command] = :push
+        end
+        opts.on('-R', '--reset', 'Reset repos to origin/master branch') do
+          options[:command] = :reset_to_master
+        end
+        opts.on('-S', '--search', 'Search - requires one or more search_spec - searches current branch') do
+          options[:command] = :search
+        end
+        opts.on('--sar', '--search-and-replace', 'Search and replace - requires one or more sar_spec') do
+          options[:command] = :search_and_replace
+        end
+        opts.on('--stage', 'Stage changes (will not stage in master)') do
+          options[:command] = :stage
+        end
+        opts.on('-T', '--topics', 'View or modify repo topics') do
+          options[:command] = :topics
+        end
+        opts.on('-U', '--update', 'Update repos (pull or fetch/rebase); checks out branch if exists') do
+          options[:command] = :update
+        end
+        opts.separator ''
+        opts.separator '    repo_spec is a comma-separated list of repo name and/or regexs used to match repo names.'
+        opts.separator '      ex: "legacy-prod,service-.*"'
+        opts.separator ''
+        opts.separator '    search_spec is [repo_spec,][s]/search[/,s/...] - search term(s) are static or a regex (with --regex)'
+        opts.separator '      ex: "s/hostname"'
+        opts.separator '      ex: "legacy.*,s/old_hostname,s/other_hostname/i"'
+        opts.separator ''
+        opts.separator '    sar_spec is [repo_spec,]s/search_string/replace_string/[modifier(s)] - Perl syntax named backrefs can be used.'
+        opts.separator '      ex: "service.*,s/old_hostname/new_hostname/gi"'
+        opts.separator '      ex: "legacy.*,service-.*,s/old(?<inc>\d\d).domain/new-$+{inc}.domain.name/gi"'
+        opts.separator ''
+        opts.separator 'Options:'
+        opts.on('-b', '--branch=BRANCH', 'Branch operated on (will be created for destructive actions)',
+                "(or use GHREP_BRANCH env variable; current: #{options[:branch]})") do |arg|
+          options[:branch] = arg
+        end
+        opts.on('--csv', "Use CSV output") do |arg|
+          options[:csv] = true
+        end
+        opts.on('--debug', 'Debug log output') do
+          options[:log_level] = DEBUG
+        end
+        opts.on('-d', '--dir=DIR', "Target directory for repos (or use GHREP_DIR env variable; current: #{options[:repo_dir]})") do |arg|
+          options[:repo_dir] = arg.sub(/\/*$/, '')
+        end
+        opts.on('--exclude=EXTENSIONS', "Exclude file extensions (default: #{options[:exclude].join(",")})") do |ext|
+          options[:exclude] = ext.split(',')
+        end
+        opts.on('-f', '--force', 'Action differs based on command') do
+          options[:force] = true
+        end
+        opts.on('--github-host=HOST', 'GitHub SSH Host string (or use GITHUB_HOST env variable) (current: git@github.com)') do |arg|
+          options[:ssh_host] = arg
+        end
+        opts.on('-h', '--help', 'Display this help') do
+          puts opts
+          exit 1
+        end
+        opts.on('-m', '--message=MESSAGE', 'Commit message; use with --commit or --pull-request') do |mesg|
+          options[:message] = mesg
+        end
+        opts.on('-o', '--github-org=ORG', 'GitHub org name (or use GITHUB_ORG env variable), defaults to user only') do |arg|
+          options[:github_org] = arg
+        end
+        opts.on('-q', '--quiet', 'Quiet log output') do
+          options[:log_level] = QUIET
+        end
+        opts.on('-r', '--regex', 'Use regex search strings') do
+          options[:regex] = true
+        end
+        opts.on('--search-boundary=BOUNDARY', "Search boundary (default: #{options[:search_boundary]})") do |arg|
+          options[:search_boundary] = arg
+        end
+        opts.on('-t', '--github-token=TOKEN', 'GitHub Personal Access Token (or use GITHUB_TOKEN env variable)',
+               'Obtain a Personal Access Token from GitHub -> Settings -> Developer Settings ') do |arg|
+          options[:github_token] = arg
+        end
+        opts.on('--threads=THREADS', "Max number of threads (default: #{options[:threads]})") do |arg|
+          options[:threads] = arg
+        end
+        opts.on('--title=TITLE', "Pull request title (default: \"#{options[:title]}\")") do |arg|
+          options[:title] = arg
+        end
+        opts.on('-u', '--github-user=USER', 'GitHub user name (or use GITHUB_USER env variable)') do |arg|
+          options[:github_user] = arg
+        end
+        opts.on('-v', '--verbose', 'Verbose log output') do
+          options[:log_level] = VERBOSE
+        end
+        opts.on('--width=COLUMNS', "Format output to this width (does not affect --csv, current: #{options[:output_width]})") do |arg|
+          options[:output_width] = arg
+        end
+        opts.separator ''
+        opts.separator '    This tool is designed around a particular git workflow. The set branch (see --branch) is used when available, and created'
+        opts.separator '    when destructive operations occur (ie: --search-and-replace), otherwise, master is used. Search (and replace) operations'
+        opts.separator '    are regex based, and are constructed with the supplied search (and replace) terms escaped (unless --regex is used), and'
+        opts.separator '    boundaried with all permutations of line start, line end and --boundary on both front and back.'
+        opts.separator ''
+        opts.separator '    Example usage:'
+        opts.separator '      ghrep --search --regex "AKIA.{16}" --csv      <- searches all repos AWS keys, output in CSV'
+        opts.separator '      ghrep --search --regex "aud.*,c,AKIA.{16}"    <- searches all repos starting with aud or c for AWS keys'
+        opts.separator '      ghrep --sar s/old_host/new_host/gi            <- searches and replace across all repos'
+        opts.separator '      ghrep --topics                                <- displays topics for all repos'
+      end
+      
+      op.parse!(args)
+
+      Ghrep::log :set_log_level, options[:log_level]
+
+      options[:base_url] = 'https://api.github.com/%s' % (options[:github_org] ? "orgs/#{options[:github_org]}" : "users/#{options[:github_user]}")
+
+      if options[:branch] == 'master' and !options[:force]
+        Ghrep::log QUIET, "Error: operations not allowed on master branch.\n"
+        exit(-1)
+      end
+
+      options.merge({ remaining_args: args })
+    end      
+  end      
+end
+#require_relative 'ghrep/parse_terms.rb'
+module Ghrep
+  class ParseTerms < Hash
+    REGEX_SEARCH = %r{^s?/([^/]+)(/i?)?$}
+    REGEX_SEARCH_REPLACE = %r{^s?/([^/]+)/(.*)(/[ig]*)$}
+
+    def initialize(
+      tactic:,
+      delim:      ',',
+      input:      [:all],
+      white_list: [:any]
+    )
+      unless [String, Regexp].include? (@delim = delim).class
+        raise ArgumentError.new("Invalid delimiter type: #{@delim.class}")
+      end
+      @errors = false
+      @white_list = white_list
+      case @tactic = tactic
+      when :plus_minus
+        Struct.new('PlusMinus', :plus, :minus)
+        input.each { |i| parse_plus_minus!(i) }
+      when :search, :search_replace
+        Struct.new('SearchReplace', :search, :replace, :modifier)
+        input.each { |i| parse_search_replace!(i) }
+      else
+        raise ArgumentError => "Invalid parse tactic :#{@tactic.to_s}"
+      end
+      raise ParseTermsError.new(@errors.join("\n")) if @errors
+      super()
+    end
+
+    def self.autodetect(args)
+      words = args.join(',').split(',')
+      if words.reduce(false) { |a, e| a || /^[\+\-]/.match(e) }
+        :plus_minus
+      elsif words.reduce(false) { |a, e| a || REGEX_SEARCH.match(e) }
+        :search
+      elsif words.reduce(false) { |a, e| a || REGEX_SEARCH_REPLACE.match(e) }
+        :search_replace
+      end
+    end
+
+    private
+
+    def log_error(error) (@errors ||= []) << error ; end
+
+    def parse_plus_minus!(input)
+      targets, plus, minus = [], [], []
+      first = true
+      input.split(@delim).each do |word|
+        case word
+        when /^\+/
+          plus << word.sub(/^\+/, '')
+        when /^-/
+          minus << word.sub(/^-/, '')
+        else
+          begin
+            targets, first = parse_word(targets, word, first)
+          rescue ParseTermsError => error
+            log_error "Invalid repo or topic string: #{word}"
+            next
+          end
+        end
+      end
+      targets.uniq.each do |target|
+        if key? target
+          self[target].plus += plus
+          self[target].minus += minus
+        else
+          self[target] = Struct::PlusMinus.new(plus, minus)
+        end
+      end
+    end
+
+    def parse_search_replace!(input)
+      targets, search_replace = [], []
+      first = true
+      input.split(@delim).each do |word|
+        if @tactic == :search && search_matches = word.match(REGEX_SEARCH)
+          modifier = search_matches[2] ? search_matches[2].sub(%r{^/}, '') : ''
+          search_replace << [search_matches[1], nil, modifier]
+        elsif @tactic == :search_replace && search_matches = word.match(REGEX_SEARCH_REPLACE)
+          modifier = search_matches[3].sub(%r{^/}, '')
+          search_replace << [search_matches[1], search_matches[2], modifier]
+        else
+          begin
+            targets, first = parse_word(targets, word, first)
+          rescue ParseTermsError => error
+            log_error "Invalid repo or %s string: #{word}" % [@tactic.to_s]
+            next
+          end
+        end
+      end
+      targets = validate_word(:all) if first
+      targets.uniq.each do |target|
+        self[target] ||= []
+        self[target] += search_replace.map do |sr|
+          Struct::SearchReplace.new(*sr)
+        end
+        self[target].uniq!
+      end
+    end
+
+    def parse_word(targets, word, first)
+      if word =~ /^\^/
+        targets = validate_word(:all) if targets.empty? and first
+        # TODO: add regexp support
+        validate_word(word.sub('^', '')).each { |x| targets.delete x }
+      else
+        targets += validate_word word
+        first = false
+      end
+      [targets, first]
+    end
+
+    def validate_word(word)
+      if word == :all
+        @white_list.dup
+      elsif word =~ /^\^/
+        word
+      elsif @white_list.include?(word) or @white_list.include?(:any)
+        [word]
+      elsif (matched = @white_list.select { |i| /^#{word}$/.match i }).length > 0
+        matched
+      else
+        raise ParseTermsError.new
+      end
+    end
+  end
+
+  class ParseTermsError < StandardError ; end
+end
+#require_relative 'ghrep/repo.rb'
+module Ghrep
+  require 'json'
+
+  class Repo
+    attr_reader :description, :name, :path
+
+    def initialize(github_object: nil, path_prefix: nil, ssh_host: nil)
+      @github_object = github_object
+      @path_prefix   = path_prefix
+      @ssh_host      = ssh_host
+      @name          = @github_object['name']
+      @description   = @github_object['description']
+      @path          = "#{@path_prefix}/#{@name}"
+      @state_descriptions = {
+        :clean               => 'Clean',
+        :not_master          => 'Clean (not master)',
+        :not_present         => 'Not Present',
+        :unstaged_changes    => 'Unstaged Changes',
+        :uncommitted_changes => 'Uncommitted Changes',
+      }
+    end
+
+    def branches(cached: false, raw: false)
+      @branch_cache = git('branch').output unless cached and defined? @branch_cache
+      if raw
+        @branch_cache
+      else
+        @branch_cache.map { |branch| branch.sub(/^. /, '').chomp }
+      end
+    end
+
+    def branches_url
+      @github_object['branches_url']
+    end
+
+    def is_current_branch?(branch)
+      current_branch == branch
+    end
+
+    def differs_from_origin?(branch=current_branch)
+      if branch != current_branch
+        :not_current
+      elsif git(%W(diff origin/#{branch} --quiet --exit-code)).exitstatus > 0
+        true
+      else
+        false
+      end
+    end
+
+    def current_branch(cached: true)
+      if is_present?
+        if branches(cached: cached, raw: true).grep(/^\* /).empty?
+          '*NO BRANCHES*'
+        else
+          branches(cached: true, raw: true).grep(/^\* /)
+            .first
+            .sub(/^\* /, '')
+            .chomp
+        end
+      else
+        'n/a'
+      end
+    end
+
+    def git(args, no_path: false, stdout: false)
+      GitCommand.new(args: args, path: (no_path ? nil : path), stdout: stdout)
+    end
+
+    def is_present?
+      File.directory? path
+    end
+
+    def state_description_max_length
+      @state_descriptions.values.reduce(0) { |a, e| e.length > a ? e.length : a }
+    end
+
+    def state_description
+      @state_descriptions[state]
+    end
+
+    def ssh_url
+      if @ssh_host
+        @github_object['ssh_url'].sub(/^.*:/, "#{@ssh_host}:")
+      else
+        @github_object['ssh_url']
+      end
+    end
+
+    def uncommitted_changes?
+      git('status --porcelain').output.reduce(false) { |a, e| e =~ /^[^ ?]/ || a }
+    end
+
+    def unstaged_changes?
+      git('status --porcelain').output.reduce(false) { |a, e| e =~ /^.[^ ?]/ || a }
+    end
+
+    def state
+      if !is_present?
+        :not_present
+      elsif unstaged_changes?
+        :unstaged_changes
+      elsif uncommitted_changes?
+        :uncommitted_changes
+      elsif !is_current_branch? 'master'
+        :not_master
+      else
+        :clean
+      end
+    end
+
+    def to_s
+      @name
+    end
+
+    def topics
+      @github_object['topics']
+    end
+
+    def url
+      @github_object['url']
+    end
+  end
+end
+#require_relative 'ghrep/repo_spec.rb'
+module Ghrep
+  require 'singleton'
+
+  class RepoSpec
+    include Singleton
+
+    attr_accessor :repo_list
+
+    def initialize
+      @cache = {}
+      @repo_list = []
+    end
+
+    def match(spec)
+      @cache[spec] ||= build_match(spec)
+    end
+
+    private
+
+    def build_match(raw_list)
+      return @repo_list.sort if raw_list.to_a.length == 0
+      bad_repo_specs = false
+      repos = []
+      raw_list.to_a.map do |raw_clause|
+        raw_clause.split(',')
+      end.flatten
+        .each do |repo_spec|
+        matching_repos = @repo_list.select { |repo_name| repo_name =~ /^#{repo_spec}$/ }
+        if matching_repos.length == 0
+          puts "Error: repo_spec has no matches: #{repo_spec}\n"
+          bad_repo_specs = true
+        end
+        matching_repos.each { |repo_name| repos << repo_name }
+      end
+      raise RepoSpecError, 'Invalid repo_spec' if bad_repo_specs
+      repos.sort.uniq
+    end
+  end
+
+  class RepoSpecError < StandardError ; end
+end
+#require_relative 'ghrep/repos.rb'
+module Ghrep
+  require 'csv'
+  require 'digest'
+  require 'fileutils'
+  require 'set'
+
+  class Repos < Hash
+    def initialize(options)
+      @options = options
+      @github = GitHub.new(base_url: @options[:base_url],
+                           user:     @options[:github_user],
+                           token:    @options[:github_token])
+      define_struct_output_format
+      populate!
+    end
+  
+    def clone!
+      effective_repos.each do |repo|
+        if repo.state != :not_present and @options[:force]
+          log "#{repo.name} -> Destroying local copy\n"
+          FileUtils.rm_rf repo.path
+        end
+        if repo.state == :not_present
+          log "#{repo.name} -> "
+          repo.git(['clone', repo.ssh_url, repo.path], no_path: true)
+        else
+          log "#{repo.name} -> Skipping existing repo\n"
+        end
+      end
+    end
+    
+    def commit!
+      effective_repos.each do |repo|
+        if repo.current_branch == 'master'
+          log VERBOSE, "#{repo} - Skipping repo - branch is master\n"
+        elsif repo.uncommitted_changes?
+          if @options[:message]
+            log "#{repo} -> Committing changes..."
+            repo.git ['commit', '-m', @options[:message]]
+            log "\n"
+          else
+            log "#{repo} -> Committing changes...\n"
+            repo.git('commit', stdout: true)
+          end
+        elsif repo.unstaged_changes?
+          log "Unstaged changes but no staged changes to commit in #{repo}\n"
+        else
+          log VERBOSE, "No changes changes in #{repo}\n"
+        end
+      end
+    end
+  
+    def diff!
+      effective_repos.select { |repo| repo.is_present? }.each do |repo|
+        log VERBOSE, "#{repo} - Calculating diff\n"
+        repo.git(['diff', '-U0', '--word-diff'], stdout: true)
+      end
+    end
+  
+    def list!
+      output = Struct::OutputFormat.new(@options[:csv], list_fields, @options[:output_width])
+  
+      log QUIET, output.header
+  
+      effective_repos.each do |repo|
+        log QUIET, output.line(
+          repo.name,
+          repo.current_branch,
+          repo.state_description,
+          repo.description,
+        )
+      end
+    end
+  
+    def pull_request!
+      effective_repos.select do |repo|
+        repo.state == :not_master and repo.current_branch == op_branch
+      end.each do |repo|
+        begin
+          log "Processing PR for #{repo}..."
+          response = github_create_pull_request repo
+          log "Success - #{response.content['html_url']}\n"
+        rescue GitHubError => mesg
+          if mesg.message == '422'
+            puts "#{mesg.backtrace[1]} - skipping."
+          else
+            raise
+          end
+        end
+      end
+    end
+  
+    def push!
+      effective_repos.each do |repo|
+        if repo.current_branch != op_branch
+          log VERBOSE, "#{repo} -> Skipping, branch is not #{op_branch}\n"
+          next
+        end
+        log "#{repo} -> Pushing #{op_branch}"
+        repo.git ['push', '--set-upstream', 'origin', @options[:branch]]
+        log "\n"
+      end
+    end
+  
+    def reset_to_master!
+      effective_repos.each do |repo|
+        log "#{repo} -> resetting..."
+        repo.git(['checkout', 'master', '-q']) if repo.current_branch != 'master'
+        repo.branches.grep_v('master').each do |branch|
+          log "deleting branch #{branch}..."
+          repo.git ['branch', '-D', branch]
+        end
+        repo.git ['reset', '--hard']
+        repo.git ['clean', '-fxd']
+        log "\n"
+      end
+    end
+  
+    def search!
+      output = Struct::OutputFormat.new(
+        @options[:csv],
+        {
+          repo_name: {
+            min: 9,
+            max: keys.reduce(0) { |a, e| e.length > a ? e.length : a },
+          },
+          file:      { min: 12, max:  30 },
+          line:      { min:  4, max:   7, format: '%%%<actual>d.%<actual>ds' },
+          context:   { min: 10, max: 100 },
+        },
+        @options[:output_width]
+      )
+      log QUIET, output.header
+  
+      targets = ParseTerms.new(
+        input:      @options[:remaining_args],
+        tactic:     :search,
+        white_list: keys.sort,
+      )
+      old_pwd = Dir.pwd
+      Dir.chdir @options[:repo_dir]
+      targets.each do |repo_name, searches|
+        command = search_command(repo_name,
+                                 self[repo_name].path,
+                                 searches.map { |e| e.search },
+                                 searches.map { |e| e.modifier })
+        log VERBOSE, "Running command: #{command}\n"
+        log VERBOSE, "#{repo_name} -> searching...\n"
+        IO.popen({ 'LC_ALL' => 'C' }, command) do |io|
+          while line = io.gets
+            repo_file, line, string = line.chomp.split(/[\000:]/, 3)
+            repo, file = repo_file.sub(@options[:repo_dir], '').split('/', 3)[1,2]
+            log QUIET, output.line(repo, file, line, string)
+          end
+          io.close
+        end
+      end
+      Dir.chdir(old_pwd)
+    end
+  
+    def search_and_replace!
+      targets = ParseTerms.new(
+        input:      @options[:remaining_args],
+        tactic:     :search_replace,
+        white_list: keys.sort,
+      )
+      old_pwd = Dir.pwd
+      Dir.chdir @options[:repo_dir]
+      targets.each do |repo_name, searches|
+        command = sar_command(repo_name, self[repo_name].path, searches)
+        log VERBOSE, "Running command: #{command}\n"
+        log "#{repo_name} -> searching..."
+        original_branch = self[repo_name].current_branch
+        self[repo_name].git ['checkout', '-B', op_branch, '-q']
+        md5_before = Digest::MD5.digest(self[repo_name].git(['diff', '--shortstat']).output.join)
+        system({ 'LC_ALL' => 'C' }, command)
+        md5_after = Digest::MD5.digest(self[repo_name].git(['diff', '--shortstat']).output.join)
+        if md5_before == md5_after
+          log "no changes\n"
+          self[repo_name].git ['checkout', '-B', original_branch, '-q']
+        else
+          log self[repo_name].git(['diff', '--shortstat']).output.first
+        end
+      end
+      Dir.chdir(old_pwd)
+    end
+  
+    def stage!
+      effective_repos.each do |repo|
+        if repo.current_branch == 'master'
+          log VERBOSE, "#{repo} -> Skipping, branch is master\n"
+        elsif repo.state == :unstaged_changes
+          log "#{repo} -> Staging changes..."
+          repo.git ['add', '-A']
+          log "\n"
+        end
+      end
+    end
+  
+    def topics!
+      targets = ParseTerms.new(input:      @options[:remaining_args],
+                               tactic:     :plus_minus,
+                               white_list: keys.sort)
+      topics = {}
+      targets.each do |target|
+        repo_name, plus_minus = target.first, target.last
+        topic_set = self[repo_name].topics.to_set + plus_minus.plus - plus_minus.minus
+        topics[repo_name] = topic_set.to_a
+        topic_plus = (topic_set - self[repo_name].topics.to_set).to_a
+        topic_minus = (self[repo_name].topics.to_set - topic_set).to_a
+        if [topic_plus.length, topic_minus.length].max > 0
+          log "Updating topics on #{repo_name} (%s)..." % [
+            (topic_plus.map { |e| "+#{e}" } + topic_minus.map { |e| "-#{e}" }).join(',')
+          ]
+          begin
+            response = github_update_topics self[repo_name], topic_set.to_a
+            log "Updated.\n"
+          rescue GitHubError => mesg
+            if mesg.message == '422'
+              puts "#{mesg.backtrace[1]} - skipping."
+              topics[repo_name] = self[repo_name].topics
+            else
+              raise
+            end
+          end
+        end
+      end
+
+      output = Struct::OutputFormat.new(
+        @options[:csv],
+        {
+          repo_name: {
+            min: 9,
+            max: targets.keys.reduce(0) { |a, e| e.length > a ? e.length : a },
+          },
+          topics: {
+            min: 10,
+            max: topics.values.reduce(0) { |a, e| e.join(',').length > a ? e.join(',').length : a },
+          },
+        },
+        @options[:output_width]
+      )
+      log QUIET, output.header
+
+      targets.each do |target|
+        repo_name, plus_minus = target.first, target.last
+        log QUIET, output.line(repo_name, topics[repo_name].join(','))
+      end
+    end
+  
+    def update!
+      effective_repos.each do |repo|
+        log "#{repo} -> "
+        unless [:clean, :not_master].include? repo.state
+          log "Skipping (#{repo.state_description})...\n"
+          next
+        end
+        log "updating..."
+        repo.git 'remote update origin --prune >/dev/null 2>/dev/null'
+        log "resetting..."
+        repo.git %w(reset --hard --quiet)
+        log "\n"
+      end
+    end
+  
+    def update_old!
+      effective_repos.each do |repo|
+        if repo.state == :not_present
+          log "#{repo} -> Skipping missing repo..."
+        else
+          log "#{repo} -> "
+          ['master', @options[:branch]].each do |branch|
+            next unless remote_branches_of(repo).key? branch
+            unless repo.current_branch == branch
+              repo.git ['checkout', '-B', branch, '-q']
+            end
+            log "Pulling #{branch}..."
+            pp %W(pull origin --quiet --rebase --stat +#{branch}:#{branch})
+            repo.git %W(pull origin --quiet --rebase --stat +#{branch}:#{branch})
+          end
+        end
+        if repo.current_branch == @options[:branch] and remote_branches_of(repo).key? 'master'
+          old_pwd = Dir.pwd
+          Dir.chdir(repo.path)
+          log "Rebasing..."
+          repo.git %w(rebase origin/master)
+          Dir.chdir(old_pwd)
+        end
+        log "\n"
+      end
+    end
+  
+    private
+  
+    def define_struct_output_format
+      Struct.new('OutputFormat', :csv, :fields, :width) do
+        def field_names
+          fields.keys.map do |field| 
+            field.to_s
+              .split('_')
+              .map(&:capitalize)
+              .join(' ')
+          end
+        end
+  
+        def header
+          if csv
+            field_names.to_csv
+          else
+            [string_format % field_names,
+             string_format % sub_header].join
+          end
+        end
+  
+        def line(*args)
+          if csv
+            args.to_csv
+          else
+            string_format % args
+          end
+        end
+  
+        private
+  
+        def default_field_format
+          '%%-%<actual>d.%<actual>ds'
+        end
+  
+        # TODO: apply reduction proportionally to min-max size diff instead of max only
+        #   this will bias reduction to more dynamic fields
+        def generate_string_format
+          fields_min = fields.reduce(0) { |a, e| a + e.last[:min] } + fields.length
+          fields_max = fields.reduce(0) { |a, e| a + e.last[:max] } + fields.length
+          max_factor = [width.to_f / fields_max, 1].min
+          total = fields.values.reduce(0) { |a, size|
+            (size[:actual] = [
+              size[:min], (size[:max] * max_factor).to_i
+            ].max) + a + 1
+          }
+          rounding_offset = [total - width, 0].max
+          fields.values.last[:actual] -= rounding_offset
+          fields.values.map do |size|
+            sprintf(size[:format] || default_field_format, {
+              actual: size[:actual],
+              min:    size[:min],
+              max:    size[:max],
+            })
+          end.join(' ') + "\n"
+        end
+  
+        def string_format
+          @string_format ||= generate_string_format
+        end
+  
+        def sub_header
+          fields.values.map { |field| '-' * field[:actual] }
+        end
+      end
+    end
+  
+    def effective_repos
+      effective_repo_names.map { |repo_name| self[repo_name] }
+    end
+  
+    def effective_repo_names
+      RepoSpec.instance().match(@options[:remaining_args])
+    end
+  
+    def github_create_pull_request(repo)
+      # https://developer.github.com/v3/pulls/#create-a-pull-request
+      @github.post(url:  "#{repo.url}/pulls",
+                   body: { 'title': @options[:title], 'body':  @options[:message] || pull_request_message,
+                           'head':  @options[:branch],
+                           'base':  'master' }.to_json)
+    end
+  
+    def github_update_topics(repo, topics)
+      # https://developer.github.com/v3/repos/#replace-all-topics-for-a-repository
+      @github.put(url:  "#{repo.url}/topics",
+                  body: { 'names': topics }.to_json)
+    end
+
+    def list_fields
+      fields = {
+        repo_name: {
+          min: 9,
+          max: effective_repo_names.reduce(0) { |a, e| e.length > a ? e.length : a },
+        },
+        branch: {
+          min: 7,
+          max: [@options[:branch].length, 'master'.length].max,
+        },
+        state: {
+          min: 10,
+          max: values.first.state_description_max_length,
+        },
+        description: {
+          min: 20,
+          max: values.reduce(0) { |a, repo| repo.description.to_s.length > a ? repo.description.length : a }, },
+      }
+    end
+  
+    def log(log_level = 1, message)
+      print message if log_level <= @options[:log_level]
+    end
+  
+    def op_branch
+      @options[:branch]
+    end
+  
+    def populate!
+      @github.get_all_pages("/repos?type=all&per_page=100")
+        .each do |repo_list|
+          repo_list.content.each do |repo|
+              repo_obj = Repo.new(github_object: repo,
+                                  path_prefix:   @options[:repo_dir],
+                                  ssh_host:      @options[:ssh_host])
+            self[repo_obj.name] = repo_obj
+          end
+        end
+      RepoSpec.instance().repo_list = keys
+    end
+  
+    def pull_request_message
+      'This PR was submitted by ghrep, and likely contains the result ' +
+      'of a bulk search and replace operation.'
+    end
+  
+    def remote_branches_of(repo)
+      @remote_branches ||= {}
+      @remote_branches[repo.name] ||= get_remote_branches_of(repo)
+    end
+  
+    def get_remote_branches_of(repo)
+      pages = @github.get_all_pages(repo.branches_url.sub('{/branch}', "?per_page=100"))
+      pages.reduce({}) do |a, e|
+        new_hash = Hash[e.content.map { |b| [b['name'], b['commit']['sha']] }]
+        a.merge new_hash
+      end
+    end
+  
+    def find_command(repo_path)
+      case RUBY_PLATFORM
+      when /-darwin\d+$/
+        %(find -E '#{repo_path}' -type f -not \\( -regex '.*/(\.git|\.xcodeproj)/.*' -or -regex '.*\\.(#{@options[:exclude].join('|')})$' \\) -print0)
+      else
+        %(find '#{repo_path}' -regextype posix-extended -type f -not \\( -regex '.*/(\.git|\.xcodeproj)/.*' -or -regex '.*\\.(#{@options[:exclude].join('|')})$' \\) -print0)
+      end 
+    end
+  
+    def sar_command(repo_name, repo_path, sar_terms)
+      commands = {
+        find:  find_command(repo_path),
+        xargs: %(xargs -0 -n64 -P#{@options[:threads]}),
+        perl:  %(perl -pi -e '#{sar_regex(sar_terms, repo_name)}')
+      }
+      "#{commands[:find]} \\\n | #{commands[:xargs]} #{commands[:perl]}"
+    end
+  
+    def sar_regex(sar_terms, repo_name)
+      sar_terms.map do |term|
+        search = @options[:regex] ? term.search : term.search.gsub('.', '\.')
+        sar_regex_single(@options[:search_boundary], search, term.replace, term.modifier)
+      end.join(',')
+    end
+  
+    def sar_regex_single(boundary, search, replace, modifier)
+      ["s/(?<front>#{boundary})#{search}(?<back>#{boundary})/$+{front}#{replace}$+{back}/#{modifier}",
+       "s/(?<front>#{boundary})#{search}$/$+{front}#{replace}/#{modifier}",
+       "s/^#{search}(?<back>#{boundary})/#{replace}$+{back}/#{modifier}",
+       "s/^#{search}$/#{replace}/#{modifier}"].join(',')
+    end
+  
+    def search_command(repo_name, repo_path, search_terms, modifier)
+      commands = {
+        find:  find_command(repo_path),
+        xargs: %(xargs -0),
+        egrep: %(egrep --null -nE '#{search_regex(search_terms, repo_name, modifier)}'),
+      }
+      "#{commands[:find]} \\\n | #{commands[:xargs]} #{commands[:egrep]}"
+    end
+  
+    def search_regex(search_terms, repo_name, modifier)
+      search_terms.map do |term|
+        search = @options[:regex] ? term : term.gsub('.', '\.')
+        search_regex_single(@options[:search_boundary], term, modifier)
+      end.join('|')
+    end
+  
+    # TODO: convert from egrep to perl for consistency with sar
+    def search_regex_single(boundary, search, modifier)
+      ["#{boundary}#{search}#{boundary}",
+       "#{boundary}#{search}$",
+       "^#{search}#{boundary}",
+       "^#{search}$"].join('|')
+    end
+  end
+end
+
+module Ghrep
+  # https://tools.ietf.org/html/rfc7231#section-6.1
+  GITHUB_ERRORS = {
+    401 => 'Unauthorized',
+    404 => 'Not Found',
+  }
+
+  GIT_COMMAND = 'git'
+
+  # Log levels
+  QUIET       = 0
+  NORMAL      = 1
+  VERBOSE     = 2
+  DEBUG       = 3
+
+  def self.get_term_width
+    STDOUT.winsize.last
+  rescue Errno::EINVAL, Errno::ENOTTY
+    240
+  end
+
+  def self.log(log_level=NORMAL, message)
+    Log.instance().log(log_level, message)
+  end
+
+  def log(log_level=NORMAL, message)
+    Log.instance().log(log_level, message)
+  end
+end
+
+begin
+  options = Ghrep::ParseCommandLineArgs.instance().parse(ARGV)
+  repos = Ghrep::Repos.new(options)
+  eval "repos.#{options[:command].to_s}!"
+rescue Ghrep::GitHubError => error
+  print "GitHubError Exception: #{error.message} "
+  puts error.backtrace.take(options[:log_level] < 2 ? 2 : 100).join("\n -> ")
+  exit(-1)
+rescue Ghrep::ParseTermsError => error
+  puts error.message
+  exit(-1)
+rescue Ghrep::RepoSpecError
+  exit(-1)
+rescue OptionParser::InvalidOption => error
+  puts error.message
+  puts parser
+  exit(-1)
+end

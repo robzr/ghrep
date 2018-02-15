@@ -9,7 +9,6 @@ require 'benchmark'
 require 'io/console'
 require 'pp'
 
-require_relative 'ghrep/parse_command_line_args.rb'
 require_relative 'ghrep/git_command.rb'
 require_relative 'ghrep/github.rb'
 require_relative 'ghrep/github_error_message.rb'

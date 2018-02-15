@@ -16,3 +16,4 @@ bin/ghrep : $(GHLIB).rb $(GHLIB)/*.rb
 	chmod 755 bin/ghrep
 
 clean : ; rm -f bin/ghrep
+

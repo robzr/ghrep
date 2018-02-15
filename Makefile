@@ -1,5 +1,7 @@
 GHLIB=lib/ghrep
 
+all : ghrep
+
 ghrep : bin/ghrep
 
 bin/ghrep : $(GHLIB).rb $(GHLIB)/*.rb

@@ -1725,8 +1725,12 @@ begin
   repos = Ghrep::Repos.new(options)
   eval "repos.#{options[:command].to_s}!"
 rescue Ghrep::GitHubError => error
-  print "GitHubError Exception: #{error.message} "
-  puts error.backtrace.take(options[:log_level] < 2 ? 2 : 100).join("\n -> ")
+  if error.message.to_s == '404'
+    puts "Github user or org not found.  Use -h for help.  Hint: try setting GITHUB_ORG and/or GITHUB_USER"
+  else
+    print "GitHubError Exception: #{error.message} "
+    puts error.backtrace.take(options[:log_level] < 2 ? 2 : 100).join("\n -> ")
+  end
   exit(-1)
 rescue Ghrep::ParseTermsError => error
   puts error.message

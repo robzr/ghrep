@@ -28,11 +28,16 @@ module Ghrep
 
   GIT_COMMAND = 'git'
 
+  # can take regexp's or strings
+  GITHUB_RETRY_CODES = ['502']
+  GITHUB_RETRY_MAX_COUNT = 3
+  GITHUB_RETRY_DELAY = 1
+
   # Log levels
-  QUIET       = 0
-  NORMAL      = 1
-  VERBOSE     = 2
-  DEBUG       = 3
+  QUIET   = 0
+  NORMAL  = 1
+  VERBOSE = 2
+  DEBUG   = 3
 
   def self.get_term_width
     STDOUT.winsize.last

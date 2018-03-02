@@ -13,7 +13,7 @@ module Ghrep
       uri = URI.parse(fluff_url url)
       request = Net::HTTP::Get.new(uri.request_uri, default_headers)
       request.basic_auth(@user, @token)
-      Struct::GitHubResponse.new(http(uri).request request)
+      make_github_request(http(uri).request request)
     end
 
     def get_all_pages(url)
@@ -31,7 +31,7 @@ module Ghrep
       elsif form
         request.set_form_data form
       end
-      Struct::GitHubResponse.new(http(uri).request request)
+      make_github_request(http(uri).request request)
     end
 
     def put(url: nil, body: nil, form: nil)
@@ -43,10 +43,23 @@ module Ghrep
       elsif form
         request.set_form_data form
       end
-      Struct::GitHubResponse.new(http(uri).request request)
+      make_github_request(http(uri).request request)
     end
 
     private
+
+    def make_github_request(request, tries = 0)
+      Struct::GitHubResponse.new(request)
+    rescue GitHubError => exc
+      is_a_retry_code = GITHUB_RETRY_CODES.reduce(false) { |a, i| a || i === exc.message }
+      if is_a_retry_code and (tries += 1) <= GITHUB_RETRY_MAX_COUNT
+        sleep GITHUB_RETRY_DELAY
+        warn "Received GitHub result code #{exc.message}, retrying..."
+        retry
+      else
+        raise
+      end
+    end
 
     def create_struct_githubresponse
       Struct.new('GitHubResponse', :response) do
